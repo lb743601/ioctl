@@ -1,5 +1,5 @@
 build/
 .vscode/
-run/data
-run/output
+run/data/
+run/output/
 cmake-build-debug/

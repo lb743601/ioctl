@@ -17,7 +17,6 @@
 #include <opencv2/opencv.hpp>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <queue>
 
 constexpr int NUM_CAMERAS = 6;
 constexpr int FRAME_WIDTH = 1280;
@@ -31,10 +30,32 @@ std::atomic<bool> capture_images(false);
 std::vector<std::atomic<bool>> camera_saved(NUM_CAMERAS);
 std::atomic<bool> exit_program(false);
 
-// 线程安全的队列，用于保存待写入磁盘的图像数据
-std::queue<std::pair<int, std::vector<uint8_t>>> image_queue;
-std::mutex queue_mutex;
-std::condition_variable queue_cv;
+// 实现信号量类
+class Semaphore {
+public:
+    Semaphore(int count = 0)
+        : count(count) {}
+
+    void notify() {
+        std::unique_lock<std::mutex> lock(mtx);
+        ++count;
+        cv.notify_one();
+    }
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]() { return count > 0; });
+        --count;
+    }
+
+private:
+    std::mutex mtx;
+    std::condition_variable cv;
+    int count;
+};
+
+// 定义一个信号量，初始值为5，限制同时更新的相机数量
+Semaphore camera_semaphore(5);
 
 // 创建目录的函数
 void create_directory(const std::string& folder_name) {
@@ -133,24 +154,33 @@ void capture_camera(int camera_id) {
     while (!exit_program.load()) {
         auto start_time = std::chrono::high_resolution_clock::now();
 
+        // 等待信号量，确保同时只有5个相机在更新数据
+        camera_semaphore.wait();
+
         FD_ZERO(&fds_set);
         FD_SET(fds[camera_id], &fds_set);
 
-        tv.tv_sec = 2;
+        tv.tv_sec = 1;  // 设置select超时时间为1秒
         tv.tv_usec = 0;
 
         int r = select(fds[camera_id] + 1, &fds_set, NULL, NULL, &tv);
         if (r == -1) {
             std::cerr << "select错误：" << strerror(errno) << std::endl;
+            // 释放信号量
+            camera_semaphore.notify();
             break;
         } else if (r == 0) {
-            std::cerr << "select超时。" << std::endl;
+            std::cerr << "相机 " << camera_id << " select超时。" << std::endl;
+            // 释放信号量
+            camera_semaphore.notify();
             continue;
         }
 
         // 从队列中取出缓冲区
         if (ioctl(fds[camera_id], VIDIOC_DQBUF, &buf) == -1) {
             std::cerr << "缓冲区出队失败：" << device << " - " << strerror(errno) << std::endl;
+            // 释放信号量
+            camera_semaphore.notify();
             break;
         }
 
@@ -165,22 +195,23 @@ void capture_camera(int camera_id) {
 
             if (cv::waitKey(1) == 'q') {
                 exit_program = true;
+                // 释放信号量
+                camera_semaphore.notify();
                 break;
             }
         }
 
         // 检查是否需要保存图像
         if (capture_images.load() && !camera_saved[camera_id].load()) {
-            // 复制当前帧数据到缓冲区
-            std::vector<uint8_t> frame_data(buf.bytesused);
-            memcpy(frame_data.data(), buffer_start[camera_id], buf.bytesused);
+            // 创建目录
+            std::string folder_name = "data";
+            create_directory(folder_name);
 
-            // 将帧数据加入队列
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex);
-                image_queue.emplace(camera_id, std::move(frame_data));
-            }
-            queue_cv.notify_one();
+            // 保存当前帧为 .yuyv
+            std::string filename = folder_name + "/camera_" + std::to_string(camera_id) + "_" + std::to_string(std::time(nullptr)) + ".yuyv";
+            std::ofstream out_file(filename, std::ios::binary);
+            out_file.write(reinterpret_cast<char*>(buffer_start[camera_id]), buf.bytesused);
+            std::cout << "保存了相机 " << camera_id << " 的图像：" << filename << std::endl;
 
             // 设置已保存标志
             camera_saved[camera_id] = true;
@@ -189,8 +220,13 @@ void capture_camera(int camera_id) {
         // 将缓冲区重新放入队列
         if (ioctl(fds[camera_id], VIDIOC_QBUF, &buf) == -1) {
             std::cerr << "缓冲区重新入队失败：" << device << " - " << strerror(errno) << std::endl;
+            // 释放信号量
+            camera_semaphore.notify();
             break;
         }
+
+        // 释放信号量，允许其他相机更新数据
+        camera_semaphore.notify();
 
         auto end_time = std::chrono::high_resolution_clock::now();
         std::chrono::milliseconds frame_duration(30);
@@ -205,32 +241,6 @@ void capture_camera(int camera_id) {
     // 释放资源
     munmap(buffer_start[camera_id], buf.length);
     close(fds[camera_id]);
-}
-
-// 图像保存线程函数
-void image_saver() {
-    while (!exit_program.load()) {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        queue_cv.wait(lock, [] { return !image_queue.empty() || exit_program.load(); });
-
-        while (!image_queue.empty()) {
-            auto [camera_id, frame_data] = std::move(image_queue.front());
-            image_queue.pop();
-            lock.unlock();
-
-            // 创建目录
-            std::string folder_name = "data";
-            create_directory(folder_name);
-
-            // 保存图像
-            std::string filename = folder_name + "/camera_" + std::to_string(camera_id) + "_" + std::to_string(std::time(nullptr)) + ".yuyv";
-            std::ofstream out_file(filename, std::ios::binary);
-            out_file.write(reinterpret_cast<char*>(frame_data.data()), frame_data.size());
-            std::cout << "保存了相机 " << camera_id << " 的图像：" << filename << std::endl;
-
-            lock.lock();
-        }
-    }
 }
 
 // 键盘监听线程
@@ -265,7 +275,6 @@ void keyboard_listener() {
             capture_images = false;
         } else if (key == 'q') {
             exit_program = true;
-            queue_cv.notify_all();  // 通知image_saver线程退出
             break;
         }
     }
@@ -283,9 +292,6 @@ int main() {
         camera_threads.emplace_back(capture_camera, i);
     }
 
-    // 启动图像保存线程
-    std::thread saver_thread(image_saver);
-
     // 启动键盘监听线程
     std::thread listener_thread(keyboard_listener);
 
@@ -293,11 +299,6 @@ int main() {
     for (auto &t : camera_threads) {
         t.join();
     }
-
-    // 通知image_saver线程退出
-    exit_program = true;
-    queue_cv.notify_all();
-    saver_thread.join();
 
     listener_thread.join();
 

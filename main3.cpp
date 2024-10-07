@@ -22,6 +22,7 @@
 constexpr int NUM_CAMERAS = 6;
 constexpr int FRAME_WIDTH = 1280;
 constexpr int FRAME_HEIGHT = 720;
+constexpr int MAX_QUEUE_SIZE = 10;  // 设置队列的最大大小
 
 // 全局变量
 std::vector<void*> buffer_start(NUM_CAMERAS);
@@ -35,6 +36,7 @@ std::atomic<bool> exit_program(false);
 std::queue<std::pair<int, std::vector<uint8_t>>> image_queue;
 std::mutex queue_mutex;
 std::condition_variable queue_cv;
+std::condition_variable queue_not_full_cv;  // 用于通知队列不满
 
 // 创建目录的函数
 void create_directory(const std::string& folder_name) {
@@ -136,7 +138,7 @@ void capture_camera(int camera_id) {
         FD_ZERO(&fds_set);
         FD_SET(fds[camera_id], &fds_set);
 
-        tv.tv_sec = 2;
+        tv.tv_sec = 1;  // 可以尝试将超时时间减少到1秒
         tv.tv_usec = 0;
 
         int r = select(fds[camera_id] + 1, &fds_set, NULL, NULL, &tv);
@@ -144,7 +146,7 @@ void capture_camera(int camera_id) {
             std::cerr << "select错误：" << strerror(errno) << std::endl;
             break;
         } else if (r == 0) {
-            std::cerr << "select超时。" << std::endl;
+            std::cerr << "相机 " << camera_id << " select超时。" << std::endl;
             continue;
         }
 
@@ -177,7 +179,12 @@ void capture_camera(int camera_id) {
 
             // 将帧数据加入队列
             {
-                std::lock_guard<std::mutex> lock(queue_mutex);
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                // 当队列已满时，等待
+                queue_not_full_cv.wait(lock, [] { return image_queue.size() < MAX_QUEUE_SIZE || exit_program.load(); });
+                if (exit_program.load()) {
+                    break;
+                }
                 image_queue.emplace(camera_id, std::move(frame_data));
             }
             queue_cv.notify_one();
@@ -216,6 +223,8 @@ void image_saver() {
         while (!image_queue.empty()) {
             auto [camera_id, frame_data] = std::move(image_queue.front());
             image_queue.pop();
+            // 通知采集线程队列有空位
+            queue_not_full_cv.notify_one();
             lock.unlock();
 
             // 创建目录
@@ -225,8 +234,12 @@ void image_saver() {
             // 保存图像
             std::string filename = folder_name + "/camera_" + std::to_string(camera_id) + "_" + std::to_string(std::time(nullptr)) + ".yuyv";
             std::ofstream out_file(filename, std::ios::binary);
-            out_file.write(reinterpret_cast<char*>(frame_data.data()), frame_data.size());
-            std::cout << "保存了相机 " << camera_id << " 的图像：" << filename << std::endl;
+            if (!out_file) {
+                std::cerr << "无法打开文件：" << filename << std::endl;
+            } else {
+                out_file.write(reinterpret_cast<char*>(frame_data.data()), frame_data.size());
+                std::cout << "保存了相机 " << camera_id << " 的图像：" << filename << std::endl;
+            }
 
             lock.lock();
         }
@@ -265,7 +278,8 @@ void keyboard_listener() {
             capture_images = false;
         } else if (key == 'q') {
             exit_program = true;
-            queue_cv.notify_all();  // 通知image_saver线程退出
+            queue_cv.notify_all();        // 通知image_saver线程退出
+            queue_not_full_cv.notify_all(); // 通知采集线程退出
             break;
         }
     }
@@ -297,6 +311,7 @@ int main() {
     // 通知image_saver线程退出
     exit_program = true;
     queue_cv.notify_all();
+    queue_not_full_cv.notify_all();
     saver_thread.join();
 
     listener_thread.join();
