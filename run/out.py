@@ -28,7 +28,7 @@ if __name__ == "__main__":
     # 输入和输出文件夹路径
     input_folder = 'data'
     output_folder = 'output'
-    os.makedirs(output_folder, exist_ok=True)
+    os.makedirs(output_folder, exist_ok=True)  # 如果output文件夹不存在则创建
 
     # 遍历data文件夹中的所有YUYV文件
     for filename in os.listdir(input_folder):
