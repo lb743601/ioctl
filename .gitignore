@@ -2,3 +2,4 @@ build/
 .vscode/
 run/data
 run/output
+cmake-build-debug/
