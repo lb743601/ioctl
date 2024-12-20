@@ -1,0 +1,3 @@
+/home/jetson/Downloads/ioctl/CMakeFiles/rebuild_cache.dir
+/home/jetson/Downloads/ioctl/CMakeFiles/edit_cache.dir
+/home/jetson/Downloads/ioctl/CMakeFiles/multi_camera_capture.dir
